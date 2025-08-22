@@ -6,6 +6,8 @@ import plotly.express as px
 import numpy as np
 from io import BytesIO
 import zipfile
+import html
+
 
 st.set_page_config(layout="wide", page_title="PSD Engineer Efficiency Analyzer")
 st.title("PSD Engineer Efficiency Analyzer (AMS&NIS)")
@@ -67,6 +69,11 @@ with st.sidebar.expander("Difficulty Classification", expanded=False):
     time_weight  = st.slider("Time-vs-avg weight", 0.0, 3.0, 1.0, step=0.05)
     use_log_time = st.checkbox("Use log2 for Time factors (smooth)", value=True)
 
+    # Cap para el ratio de tiempo (anti-outliers)
+    cap_ratio = st.slider("Time ratio cap (robust)", 2.0, 4.0, 2.5, 0.1,
+                      help="Top for difference time vs activity; with log2, 2.5 tends to be a proper default.")
+
+
 with st.sidebar.expander("Composite Difficulty thresholds", expanded=False):
     mode_cohort_thresh = st.radio(
         "Threshold mode",
@@ -81,9 +88,60 @@ with st.sidebar.expander("Composite Difficulty thresholds", expanded=False):
     fixed_hard_max = st.number_input("Fixed: Hard < ", 0.0, 10.0, value=2.50, step=0.05)
 
     # Cohort-adaptive percentiles (usados si eliges el modo cohort)
-    pct_easy = st.slider("Cohort percentile for Easy/Medium boundary", 1, 99, 25, step=1)
-    pct_med  = st.slider("Cohort percentile for Medium/Hard boundary", 1, 99, 60, step=1)
-    pct_hard = st.slider("Cohort percentile for Hard/Very Hard boundary", 1, 99, 85, step=1)
+    pct_easy = st.slider("Cohort percentile for Easy/Medium boundary", 1, 99, 30, step=1)
+    pct_med  = st.slider("Cohort percentile for Medium/Hard boundary", 1, 99, 70, step=1)
+    pct_hard = st.slider("Cohort percentile for Hard/Very Hard boundary", 1, 99, 90, step=1)
+
+# === Sidebar: Difficulty micro‑gating (post‑classification, ultra‑compact) ===
+with st.sidebar.expander("Difficulty micro‑gating (post‑classification)", expanded=False):
+    st.caption("Demote si no cumple señales mínimas. Un control global para todo (más simple y consistente).")
+
+    # Switch global
+    mg_enable = st.checkbox("Enable micro‑gating", value=True)
+
+    # Severidad global (escala umbrales base)
+    # 0.9 = más flexible, 1.0 = balanceado, 1.1–1.2 = más estricto
+    strictness = st.slider("Strictness (global)", 0.9, 1.2, 1.0, 0.05)
+
+    # Un único 'min signals' para las tres clases (1–3). Mantiene simplicidad visual.
+    min_req_all = st.selectbox("Min signals (VH/Hard/Med)", [1, 2, 3], index=1,
+                               help="Se requieren N señales (Tiempo, DOC, Profundidad) para mantener la clase.")
+
+    # Toggles por clase (on/off)
+    col_tog = st.columns(3)
+    with col_tog[0]:
+        vh_enable = st.checkbox("Gate VH", value=True, key="vh_gate_uc")
+    with col_tog[1]:
+        hard_enable = st.checkbox("Gate Hard", value=True, key="h_gate_uc")
+    with col_tog[2]:
+        med_enable = st.checkbox("Gate Medium", value=True, key="m_gate_uc")
+
+    # ===== Presets base (no UI): thresholds por clase =====
+    # Very Hard base
+    _tf_vh_base, _doc_vh_base, _dep_vh_base = 1.5, 0.8, 3.0
+    # Hard base
+    _tf_h_base,  _doc_h_base,  _dep_h_base  = 0.6, 0.4, 2.0   # ~log2(1.5)=0.585
+    # Medium base
+    _tf_m_base,  _doc_m_base,  _dep_m_base  = 0.3, 0.2, 1.5   # ~log2(1.25)=0.321
+
+    # Escalado por strictness (aplica a los tres factores)
+    tf_vh  = _tf_vh_base  * strictness
+    doc_vh = _doc_vh_base * strictness
+    dep_vh = _dep_vh_base * strictness
+
+    tf_h   = _tf_h_base   * strictness
+    doc_h  = _doc_h_base  * strictness
+    dep_h  = _dep_h_base  * strictness
+
+    tf_m   = _tf_m_base   * strictness
+    doc_m  = _doc_m_base  * strictness
+    dep_m  = _dep_m_base  * strictness
+
+    # Unificamos el "min signals" para las tres clases (compatibles con el bloque de aplicación)
+    vh_req   = min_req_all
+    hard_req = min_req_all
+    med_req  = min_req_all
+
 
 with st.sidebar.expander("Calendar vs Timesheet (Combined Mode)", expanded=False):
     cal_weight = st.slider("Calendar weight", 0.0, 1.0, 0.5, help="Weight applied to Calendar percentile in Combined score.")
@@ -147,6 +205,71 @@ st.markdown(
 
 # --- Helpers ---
 DIFF_ORDER = ["Easy", "Medium", "Hard", "Very Hard"]
+
+# Para tablas lindas con link
+def render_interactive_link_table(df_in: pd.DataFrame, *, name_col='Task Name', url_col='Task URL',
+                                  keep_cols=None, height=450, filter_key=None, show_filter=True):
+    """Tabla ordenable con quick filter y link compacto '🔗' al lado del nombre."""
+    df = df_in.copy()
+
+    # Quick filter textual local
+    if show_filter:
+        q = st.text_input("Quick filter", value="", key=filter_key, help="Filtra por cualquier texto de la tabla.")
+        if q:
+            mask = df.apply(lambda r: r.astype(str).str.contains(q, case=False, na=False), axis=1).any(axis=1)
+            df = df[mask]
+
+    # Detectar URLs válidas; la celda debe contener la URL real
+    has_urls = (url_col in df.columns) and df[url_col].astype(str).str.strip().str.startswith(("http://","https://")).any()
+    if has_urls:
+        df['Open'] = df[url_col].astype(str).str.strip()
+
+    # Columnas base robustas
+    base_cols = (keep_cols if keep_cols else list(df.columns))
+    base_cols = [c for c in base_cols if c in df.columns or c == 'Open']
+
+    # Insertar 'Open' justo después del nombre si hay URL; si no, quitarla
+    if has_urls:
+        # quitar duplicados preservando orden
+        seen = set(); base_cols = [c for c in base_cols if not (c in seen or seen.add(c))]
+        if name_col in base_cols:
+            base_cols = [name_col] + [c for c in base_cols if c != name_col]
+            if 'Open' not in base_cols:
+                base_cols.insert(base_cols.index(name_col) + 1, 'Open')
+        else:
+            if 'Open' not in base_cols:
+                base_cols.insert(0, 'Open')
+    else:
+        base_cols = [c for c in base_cols if c != 'Open']
+
+    # Config visual: mostrar emoji chiquito (texto custom) pero mantener la URL como valor
+    col_config = {}
+    if has_urls:
+        col_config['Open'] = st.column_config.LinkColumn(
+            "Link",                 # label cortito
+            display_text="🔗",   # <-- texto mostrado (emoji)
+            #width="very-small",
+            help="Abrir la tarea en el tracker"
+        )
+
+    # Ocultar la columna con la URL cruda
+    if url_col in df.columns:
+        try:
+            df = df.drop(columns=[url_col])
+        except Exception:
+            pass
+
+    # Selección final segura
+    base_cols = [c for c in base_cols if c in df.columns]
+
+    st.dataframe(
+        df[base_cols],
+        use_container_width=True,
+        height=height,
+        hide_index=True,
+        column_config=col_config
+    )
+
 
 # DOC helpers
 def extract_doc_info(name: str, block_regex: str, sep_regex: str):
@@ -386,6 +509,18 @@ if uploaded_file:
         th_hard   = st.number_input("Min weight for Hard",   1, 10, value=8, step=1, key="doc_th_hard")
         th_vhard  = st.number_input("Min weight for Very Hard", 1, 10, value=10, step=1, key="doc_th_vhard")
 
+    with st.sidebar.expander("Task Links (optional)", expanded=False):
+        id_col_for_link = st.text_input("ID column for link", value="ID",
+            help="Column name with the ID of the task.")
+        link_template = st.text_input("Task link template", value="https://wetask.welink.huawei.com/v2/task_detail?task_id={id}",
+            help="Link structure using {id} as placeholder, ej: https://wetask.com/tasks/{id}")
+
+    # --- Task URL: siempre desde el template del sidebar con ID ---
+    if (id_col_for_link in df.columns) and link_template:
+        df['Task URL'] = df[id_col_for_link].astype(str).map(lambda x: link_template.replace("{id}", x)).str.strip()
+    else:
+        df['Task URL'] = np.nan
+
     # DOC extraction
     has_doc, item_counts = [], []
     for nm in df.get('*Name', '').astype(str):
@@ -423,14 +558,34 @@ if uploaded_file:
     use_eff_flag_for_time = use_effort_for_diff and (metric_mode in ("Timesheet", "Combined"))
     df['Base Hours'] = np.where(use_eff_flag_for_time, df['Effort_adj'], df['Duration_adj'])
 
-    act_mean = df.groupby('*Activity Type')['Base Hours'].transform('mean')
-    act_mean = act_mean.where((act_mean > 0) & np.isfinite(act_mean), other=1.0)
+    # --- ROBUSTEZ por actividad: mediana + winsorization + cap ---
+    grp = df.groupby('*Activity Type')['Base Hours']
 
-    time_ratio = df['Base Hours'] / act_mean
+    # Mediana por actividad (menos sensible a outliers)
+    act_med = grp.transform('median')
+
+    # IQR local por actividad
+    q1 = grp.transform(lambda s: np.nanpercentile(s, 25))
+    q3 = grp.transform(lambda s: np.nanpercentile(s, 75))
+    iqr = (q3 - q1).replace(0, np.nan)
+
+    # Winsorizamos Base Hours dentro de [Q1 - 1.5*IQR, Q3 + 1.5*IQR]
+    low = (q1 - 1.5 * iqr).fillna(q1)
+    high = (q3 + 1.5 * iqr).fillna(q3)
+    bh_robust = df['Base Hours'].clip(lower=low, upper=high)
+
+    # Ratio robusto contra mediana
+    time_ratio = (bh_robust / act_med).replace([np.inf, -np.inf], np.nan)
+
+    # Cap del ratio (definido en sidebar)
+    time_ratio_capped = time_ratio.clip(lower=1.0, upper=cap_ratio)
+
+    # Factor final
     if use_log_time:
-        time_factor = np.log2(time_ratio.clip(lower=1.0))  # <= 1.0 => 0
+        time_factor = np.log2(time_ratio_capped)     # 1.0 -> 0; tope en log2(cap_ratio)
     else:
-        time_factor = (time_ratio - 1.0).clip(lower=0.0)
+        time_factor = (time_ratio_capped - 1.0)      # 1.0 -> 0
+
 
     df['Composite Difficulty Score'] = (
           depth_weight * df['Effective Depth'].fillna(0)
@@ -489,15 +644,25 @@ if uploaded_file:
     # Apply filters once for the "cohort"
     cohort_df = apply_filters(df, selected_group, selected_product, selected_customer)
 
-    # === Cohort-aware baselines ===
-    act_mean_coh = cohort_df.groupby('*Activity Type')['Base Hours'].transform('mean')
-    act_mean_coh = act_mean_coh.where((act_mean_coh > 0) & np.isfinite(act_mean_coh), other=1.0)
+    # === Cohort-aware baselines (ROBUSTAS) ===
+    grp_coh = cohort_df.groupby('*Activity Type')['Base Hours']
 
-    time_ratio_coh = cohort_df['Base Hours'] / act_mean_coh
+    act_med_coh = grp_coh.transform('median')
+    q1c = grp_coh.transform(lambda s: np.nanpercentile(s, 25))
+    q3c = grp_coh.transform(lambda s: np.nanpercentile(s, 75))
+    iqr_c = (q3c - q1c).replace(0, np.nan)
+
+    low_c = (q1c - 1.5 * iqr_c).fillna(q1c)
+    high_c = (q3c + 1.5 * iqr_c).fillna(q3c)
+    bh_robust_coh = cohort_df['Base Hours'].clip(lower=low_c, upper=high_c)
+
+    time_ratio_coh = (bh_robust_coh / act_med_coh).replace([np.inf, -np.inf], np.nan)
+    time_ratio_coh = time_ratio_coh.clip(lower=1.0, upper=cap_ratio)
+
     if use_log_time:
-        time_factor_coh = np.log2(time_ratio_coh.clip(lower=1.0))
+        time_factor_coh = np.log2(time_ratio_coh)
     else:
-        time_factor_coh = (time_ratio_coh - 1.0).clip(lower=0.0)
+        time_factor_coh = (time_ratio_coh - 1.0)
 
     cohort_df['Time_Ratio']  = time_ratio_coh.fillna(1.0)
     cohort_df['Time_Factor'] = time_factor_coh.fillna(0.0)
@@ -509,6 +674,15 @@ if uploaded_file:
     cohort_df['Composite Difficulty Score'] = (
         cohort_df['Comp_Depth'] + cohort_df['Comp_DOC'] + cohort_df['Comp_Time']
     )
+
+    # --- Compatibility alias for reasoning_text ---
+    if '_ActBaseline' in df.columns:
+        act_mean = df['_ActBaseline']           # usa el mismo baseline que el score
+    else:
+        act_mean = (
+            df.groupby('*Activity Type')['Base Hours'].transform('median').fillna(1.0)
+        )
+
 
     # === Reasoning (cohort-aware) ===
     def reasoning_text_cohort(row):
@@ -539,8 +713,6 @@ if uploaded_file:
 
     cohort_df['Reasoning'] = cohort_df.apply(reasoning_text_cohort, axis=1)
 
-
-
     # === Re-classify difficulty for the current cohort ===
     scores = cohort_df['Composite Difficulty Score'].dropna()
     if mode_cohort_thresh == "Cohort-adaptive (percentiles)" and len(scores) >= 5:
@@ -562,6 +734,38 @@ if uploaded_file:
         lambda v: classify_by_cuts(v, easy_cut, med_cut, hard_cut)
     )
 
+    # --- Micro‑gating post-classification: demotion si no se cumplen señales mínimas ---
+    if 'mg_enable' in locals() and mg_enable:
+
+        # Very Hard → Hard
+        if 'vh_enable' in locals() and vh_enable:
+            mask_vh = cohort_df['Estimated Difficulty'].eq('Very Hard')
+            sig_vh = (
+                (cohort_df['Time_Factor']      >= tf_vh ).astype(int)
+            + (cohort_df['DOC_Severity']     >= doc_vh).astype(int)
+            + (cohort_df['Effective Depth']  >= dep_vh).astype(int)
+            )
+            cohort_df.loc[mask_vh & (sig_vh < vh_req), 'Estimated Difficulty'] = 'Hard'
+
+        # Hard → Medium
+        if 'hard_enable' in locals() and hard_enable:
+            mask_h = cohort_df['Estimated Difficulty'].eq('Hard')
+            sig_h = (
+                (cohort_df['Time_Factor']      >= tf_h ).astype(int)
+            + (cohort_df['DOC_Severity']     >= doc_h).astype(int)
+            + (cohort_df['Effective Depth']  >= dep_h).astype(int)
+            )
+            cohort_df.loc[mask_h & (sig_h < hard_req), 'Estimated Difficulty'] = 'Medium'
+
+        # Medium → Easy
+        if 'med_enable' in locals() and med_enable:
+            mask_m = cohort_df['Estimated Difficulty'].eq('Medium')
+            sig_m = (
+                (cohort_df['Time_Factor']      >= tf_m ).astype(int)
+            + (cohort_df['DOC_Severity']     >= doc_m).astype(int)
+            + (cohort_df['Effective Depth']  >= dep_m).astype(int)
+            )
+            cohort_df.loc[mask_m & (sig_m < med_req), 'Estimated Difficulty'] = 'Easy'
 
     # --- Compute metrics (all three so we can show deltas) ---
     metrics_all = compute_scores(cohort_df, metric_mode)
@@ -622,8 +826,18 @@ if uploaded_file:
                     .reset_index(drop=True)
                 )
 
-                st.dataframe(table_df, use_container_width=True, height=350)
+                if 'Task URL' in cohort_df.columns:
+                    table_df['Task URL'] = cohort_df.loc[mask_doc, 'Task URL'].values
 
+                render_interactive_link_table(
+                    table_df,
+                    name_col='Task Name',
+                    url_col='Task URL',
+                    keep_cols=['Task Name', 'Owner', 'Activity Type', 'Status'],
+                    height=350,
+                    filter_key="doc_blocks_tbl_filter",
+                    show_filter=True
+                )
 
 
         # Engineer Efficiency chart with view controls
@@ -669,9 +883,9 @@ if uploaded_file:
             )
 
         with _tab_diff_table:
-            # Updated table: show Composite score + Reasoning
-            _cols = ['*Name', 'Owner', 'Composite Difficulty Score', 'Estimated Difficulty', 'Reasoning']
+            _cols = ['*Name', 'Owner', 'Composite Difficulty Score', 'Estimated Difficulty', 'Reasoning', 'Task URL']
             _available = [c for c in _cols if c in cohort_df.columns]
+
             _tbl = (
                 cohort_df[_available]
                 .rename(columns={
@@ -682,7 +896,17 @@ if uploaded_file:
                 .sort_values(by=['Classification', 'Difficulty Score'], ascending=[True, False])
                 .reset_index(drop=True)
             )
-            st.dataframe(_tbl, use_container_width=True, height=450)
+
+            render_interactive_link_table(
+                _tbl,
+                name_col='Task Name',
+                url_col='Task URL',
+                keep_cols=['Task Name', 'Owner', 'Difficulty Score', 'Classification', 'Reasoning'],  # 'Open' se agrega solo
+                height=450,
+                filter_key="gp_diff_tbl_filter",
+                show_filter=True
+            )
+
 
         st.subheader("Average Duration by Activity Type")
         activity_summary = cohort_df.groupby('*Activity Type').agg({'Duration (hrs)': 'mean', 'Effective Depth': 'mean'}).reset_index()
@@ -843,8 +1067,38 @@ if uploaded_file:
             colC.metric("Rank — Combined", rank_comb, delta=(rank_comb - rank_cal) if (rank_comb and rank_cal) else None)
 
             fig_hist, fig_scatter = make_report_figures(eng_df)
-            st.plotly_chart(fig_hist, use_container_width=True)
+            # --- Task Difficulty Distribution (Engineer) with Tabs ---
+            _tab_eng_diff_chart, _tab_eng_diff_table = st.tabs(["Chart", "Table"])
+
+            with _tab_eng_diff_chart:
+                st.plotly_chart(fig_hist, use_container_width=True)
+
+            with _tab_eng_diff_table:
+                eng_cols = ['*Name', 'Owner', 'Composite Difficulty Score', 'Estimated Difficulty', 'Reasoning', 'Task URL']
+                eng_cols = [c for c in eng_cols if c in eng_df.columns]
+                eng_tbl = (
+                    eng_df[eng_cols]
+                    .rename(columns={
+                        '*Name': 'Task Name',
+                        'Composite Difficulty Score': 'Difficulty Score',
+                        'Estimated Difficulty': 'Classification'
+                    })
+                    .sort_values(by=['Classification', 'Difficulty Score'], ascending=[True, False])
+                    .reset_index(drop=True)
+                )
+                render_interactive_link_table(
+                    eng_tbl,
+                    name_col='Task Name',
+                    url_col='Task URL',
+                    keep_cols=['Task Name', 'Owner', 'Difficulty Score', 'Classification', 'Reasoning'],
+                    height=420,
+                    filter_key="ind_diff_tbl_filter",
+                    show_filter=True
+                )
+
+            # El scatter se mantiene igual, debajo:
             st.plotly_chart(fig_scatter, use_container_width=True)
+
 
             top_activities = eng_df['*Activity Type'].value_counts().head(5).reset_index()
             st.markdown("**Top 5 Activity Types:**")
@@ -862,4 +1116,4 @@ else:
     st.info("Please upload an Excel file from WeTask with the correct task structure to begin. Check the documentation in case of doubts.")
 
 st.sidebar.link_button("Documentation","https://3ms.huawei.com/km/groups/3956599/blogs/details/21549614")
-st.sidebar.text("Developed by a00401250 Alejandro Uribe for Argentina PSD. V1.0")
+st.sidebar.text("Developed by a00401250 Alejandro Uribe for Argentina PSD. V1.1")
